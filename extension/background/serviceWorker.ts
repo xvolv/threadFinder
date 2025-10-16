@@ -80,6 +80,45 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return false;
 })
 
+// Cache the first working Gemini endpoint+model for this SW lifetime
+let geminiResolvedEndpoint: { base: 'v1' | 'v1beta'; model: string } | null = null
+
+function fetchWithTimeout(resource: string, options: RequestInit, timeoutMs = 60000): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const controller = new AbortController()
+    const id = setTimeout(() => controller.abort(), timeoutMs)
+    fetch(resource, { ...options, signal: controller.signal })
+      .then((res) => {
+        clearTimeout(id)
+        resolve(res)
+      })
+      .catch((err) => {
+        clearTimeout(id)
+        if ((err as any)?.name === 'AbortError') {
+          reject(new Error('Gemini request timed out'))
+        } else {
+          reject(err)
+        }
+      })
+  })
+}
+
+function extractGeminiText(resp: any): string {
+  try {
+    const candidates = Array.isArray(resp?.candidates) ? resp.candidates : []
+    for (const cand of candidates) {
+      const parts = Array.isArray(cand?.content?.parts) ? cand.content.parts : []
+      const texts = parts
+        .map((p: any) => (typeof p?.text === 'string' ? p.text : ''))
+        .filter((t: string) => t)
+      if (texts.length) return texts.join('\n')
+    }
+    return ''
+  } catch {
+    return ''
+  }
+}
+
 async function handleGeminiRequest(prompt: string, context: string = ''): Promise<string> {
   // Get the API key from storage
   const result = await chrome.storage.sync.get('GEMINI_API_KEY');
@@ -91,6 +130,10 @@ async function handleGeminiRequest(prompt: string, context: string = ''): Promis
 
   // Prepare request body
   const body = {
+    systemInstruction: {
+      role: 'system',
+      parts: [{ text: 'Provide a concise, plain-text answer. Do not include reasoning steps. Limit to a short paragraph.' }],
+    },
     contents: [{
       role: 'user',
       parts: [{
@@ -98,51 +141,185 @@ async function handleGeminiRequest(prompt: string, context: string = ''): Promis
       }],
     }],
     generationConfig: {
-      temperature: 0.7,
+      temperature: 0.4,
       topK: 40,
       topP: 0.95,
       maxOutputTokens: 1024,
+      responseMimeType: 'text/plain',
     },
   };
 
-  // Try preferred model first, then fallback
-  const models = [
-    'gemini-1.5-flash',
-    'gemini-1.5-pro',
-  ];
+  // Try preferred model first, then fallbacks (order matters)
+  // Some API keys/projects only expose a subset of models and sometimes only on v1beta.
+  const models = ['gemini-2.5-pro', 'gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-1.0-pro', 'gemini-pro']
+  const bases: Array<'v1' | 'v1beta'> = ['v1beta', 'v1']
+
+  // Fast preflight: check reachability and key validity quickly to avoid long timeouts
+  try {
+    await fetchWithTimeout(
+      'https://generativelanguage.googleapis.com/v1beta/models',
+      { method: 'GET', headers: { 'x-goog-api-key': apiKey } },
+      5000
+    )
+  } catch (e: any) {
+    const err = new Error('Unable to reach generativelanguage.googleapis.com (preflight). Possible network/VPN/firewall/adblock issue or invalid API key.')
+    ;(err as any).details = { stage: 'preflight_listmodels_v1beta', original: String(e?.message || e) }
+    throw err
+  }
 
   let lastErr: any = null;
-  for (const model of models) {
-    const apiUrl = `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${apiKey}`;
+  // Hard-prefer a fast model first (v1beta/gemini-1.5-flash), then others
+  {
+    const base: 'v1beta' = 'v1beta'
+    const model = 'gemini-1.5-flash'
+    const apiUrl = `https://generativelanguage.googleapis.com/${base}/models/${model}:generateContent`
     try {
-      const response = await fetch(apiUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body),
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        const error = new Error(`API error (${model}): ${response.status} ${response.statusText}`);
-        (error as any).details = errorData;
-        lastErr = error;
-        // Try next model
-        continue;
+      console.log('[Gemini] try', { base, model })
+      console.time(`[Gemini] ${base}/${model}`)
+      const response = await fetchWithTimeout(
+        apiUrl,
+        { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, body: JSON.stringify(body) },
+        60000
+      )
+      console.timeEnd(`[Gemini] ${base}/${model}`)
+      if (response.ok) {
+        const data = await response.json()
+        const text = extractGeminiText(data)
+        if (text) {
+          geminiResolvedEndpoint = { base, model }
+          return text
+        }
+        const err = new Error('Gemini returned no text (possibly safety blocked)')
+        ;(err as any).details = data
+        throw err
       }
-
-      const data = await response.json();
-      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (text) return text;
-      lastErr = new Error(`Empty response from ${model}`);
     } catch (e) {
-      lastErr = e;
-      // Try next model
+      console.timeEnd(`[Gemini] ${base}/${model}`)
+      lastErr = e
+    }
+  }
+  // If we already resolved a working combo, try it first
+  if (geminiResolvedEndpoint) {
+    const { base, model } = geminiResolvedEndpoint
+    const apiUrl = `https://generativelanguage.googleapis.com/${base}/models/${model}:generateContent`
+    try {
+      const response = await fetchWithTimeout(
+        apiUrl,
+        { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, body: JSON.stringify(body) },
+        40000
+      )
+      if (response.ok) {
+        const data = await response.json()
+        const text = extractGeminiText(data)
+        if (text) return text
+        const err = new Error('Gemini returned no text (possibly safety blocked)')
+        ;(err as any).details = data
+        throw err
+      }
+    } catch {}
+  }
+
+  // Ensure we try 2.5-pro early in the general loop as well
+  const orderedModels = ['gemini-2.5-pro', ...models.filter(m => m !== 'gemini-2.5-pro')]
+  for (const base of bases) {
+    for (const model of orderedModels) {
+      const apiUrl = `https://generativelanguage.googleapis.com/${base}/models/${model}:generateContent`
+      try {
+        console.log('[Gemini] try', { base, model })
+        console.time(`[Gemini] ${base}/${model}`)
+        // Attempt up to 2 tries per endpoint to mitigate transient network issues
+        let response: Response | null = null
+        let attemptErr: any = null
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            response = await fetchWithTimeout(
+              apiUrl,
+              { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, body: JSON.stringify(body) },
+              60000
+            )
+            break
+          } catch (e) {
+            attemptErr = e
+            // brief backoff
+            await delay(250)
+          }
+        }
+        if (!response) throw attemptErr || new Error('No response')
+
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}))
+          const error = new Error(`API error (${model} on ${base}): ${response.status} ${response.statusText}`)
+          ;(error as any).details = { ...errorData, tried: { base, model } }
+          lastErr = error
+          // Try next
+          console.timeEnd(`[Gemini] ${base}/${model}`)
+          continue
+        }
+
+        const data = await response.json()
+        const text = extractGeminiText(data)
+        if (text) {
+          console.timeEnd(`[Gemini] ${base}/${model}`)
+          geminiResolvedEndpoint = { base, model }
+          return text
+        }
+        const err = new Error(`Gemini returned no text from ${model} on ${base} (possibly safety blocked)`)
+        ;(err as any).details = data
+        lastErr = err
+      } catch (e) {
+        console.timeEnd(`[Gemini] ${base}/${model}`)
+        lastErr = e
+        // Try next
+      }
     }
   }
 
+  // As a last resort, discover models dynamically via ListModels
+  const discovered = await discoverFirstGenerativeModel(apiKey)
+  if (discovered) {
+    geminiResolvedEndpoint = discovered
+    const apiUrl = `https://generativelanguage.googleapis.com/${discovered.base}/models/${discovered.model}:generateContent`
+    const response = await fetchWithTimeout(
+      apiUrl,
+      { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey }, body: JSON.stringify(body) },
+      60000
+    )
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}))
+      const error = new Error(`API error (${discovered.model} on ${discovered.base}): ${response.status} ${response.statusText}`)
+      ;(error as any).details = { ...errorData, tried: discovered }
+      throw error
+    }
+    const data = await response.json()
+    const text = extractGeminiText(data)
+    if (text) return text
+    const err = new Error('Empty response from discovered Gemini model (possibly safety blocked)')
+    ;(err as any).details = data
+    throw err
+  }
+
   throw lastErr || new Error('Gemini request failed');
+}
+
+async function discoverFirstGenerativeModel(apiKey: string): Promise<{ base: 'v1' | 'v1beta'; model: string } | null> {
+  const bases: Array<'v1' | 'v1beta'> = ['v1', 'v1beta']
+  for (const base of bases) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/${base}/models`
+      const res = await fetch(url, { method: 'GET', headers: { 'x-goog-api-key': apiKey } })
+      if (!res.ok) continue
+      const data = await res.json()
+      const models = (data?.models || []) as Array<any>
+      const candidate = models.find((m) => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes('generateContent'))
+      if (candidate?.name) {
+        // name may be like 'models/gemini-1.5-flash'
+        const parts = String(candidate.name).split('/')
+        const model = parts[parts.length - 1]
+        return { base, model }
+      }
+    } catch {}
+  }
+  return null
 }
 
 // --- Simple cache + fetch helper for Reddit ---

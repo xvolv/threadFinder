@@ -34,7 +34,6 @@ function createPanel() {
         <button data-site="stackoverflow" class="tf-tab" style="display:flex; align-items:center; gap:6px; padding:6px 10px; border:1px solid #e5e7eb; background:#f9fafb; border-radius:6px; cursor:pointer">StackOverflow</button>
         <button data-site="wikipedia" class="tf-tab" style="display:flex; align-items:center; gap:6px; padding:6px 10px; border:1px solid #e5e7eb; background:#f9fafb; border-radius:6px; cursor:pointer">Wikipedia</button>
         <button data-site="gemini-answer" class="tf-tab" style="display:flex; align-items:center; gap:6px; padding:6px 10px; border:1px solid #e5e7eb; background:#f9fafb; border-radius:6px; cursor:pointer">Gemini Answer</button>
-        <button data-site="gemini-summary" class="tf-tab" style="display:flex; align-items:center; gap:6px; padding:6px 10px; border:1px solid #e5e7eb; background:#f9fafb; border-radius:6px; cursor:pointer">Gemini Summary</button>
       </div>
     </div>
     <div id="tf-results" style="padding:10px 12px; overflow:auto; max-height: 45vh;">
@@ -50,7 +49,6 @@ function createPanel() {
     const s = shadow.querySelector('button.tf-tab[data-site="stackoverflow"]') as HTMLButtonElement | null
     const w = shadow.querySelector('button.tf-tab[data-site="wikipedia"]') as HTMLButtonElement | null
     const ga = shadow.querySelector('button.tf-tab[data-site="gemini-answer"]') as HTMLButtonElement | null
-    const gs = shadow.querySelector('button.tf-tab[data-site="gemini-summary"]') as HTMLButtonElement | null
     const rIcon = (chrome.runtime as any)?.getURL ? (chrome.runtime as any).getURL('reddit.svg') : 'reddit.svg'
     const sIcon = (chrome.runtime as any)?.getURL ? (chrome.runtime as any).getURL('stackoverflow.svg') : 'stackoverflow.svg'
     const wIcon = (chrome.runtime as any)?.getURL ? (chrome.runtime as any).getURL('wikipedia.svg') : 'wikipedia.svg'
@@ -59,7 +57,6 @@ function createPanel() {
     if (s) s.innerHTML = `<img alt="StackOverflow" src="${sIcon}" style="width:16px;height:16px;display:inline-block;"/> <span>StackOverflow</span>`
     if (w) w.innerHTML = `<img alt="Wikipedia" src="${wIcon}" style="width:16px;height:16px;display:inline-block;"/> <span>Wikipedia</span>`
     if (ga) ga.innerHTML = `<img alt="Gemini Answer" src="${gIcon}" style="width:16px;height:16px;display:inline-block;"/> <span>Gemini Answer</span>`
-    if (gs) gs.innerHTML = `<img alt="Gemini Summary" src="${gIcon}" style="width:16px;height:16px;display:inline-block;"/> <span>Gemini Summary</span>`
   } catch {}
   return { host, shadow, container }
 }
@@ -139,8 +136,8 @@ async function fetchGemini(prompt: string, context: string = '') {
     })
   }
 
-  // Add a simple timeout in case the SW is asleep
-  const withTimeout = <T>(p: Promise<T>, ms = 10000) =>
+  // Add a timeout; allow longer window to accommodate model latency
+  const withTimeout = <T>(p: Promise<T>, ms = 45000) =>
     new Promise<T>((resolve, reject) => {
       const id = setTimeout(() => reject(new Error('Gemini request timed out')), ms)
       p.then((v) => {
@@ -229,10 +226,10 @@ function showPanel(term: string) {
         setResults(shadow, list)
       } else if (site === 'gemini-answer') {
         setResults(shadow, '<div style="color:#6b7280; padding: 12px;">Asking Gemini about your selection...</div>')
-        const response = await fetchGemini(
-          `Answer the following question or provide information about the following text: ${term}`,
-          `The user selected this text on a webpage: ${term}`
-        )
+        const termShort = term.length > 1200 ? term.slice(0, 1200) + '...' : term
+        const question = `Answer the following question or provide information about the following text: ${termShort}`
+        const ctx = `The user selected this text on a webpage (truncated): ${termShort}`
+        const response = await fetchGemini(question, ctx)
         
         if (response.error) {
           const details = response.details ? `<pre style="white-space:pre-wrap; font-size:12px; color:#6b7280; margin-top:6px;">${JSON.stringify(response.details, null, 2)}</pre>` : ''
@@ -246,43 +243,6 @@ function showPanel(term: string) {
             </div>
           `)
         }
-      } else if (site === 'gemini-summary') {
-        setResults(shadow, '<div style="color:#6b7280; padding: 12px;">Summarizing results with Gemini...</div>')
-        
-        // Get the current results to summarize
-        const currentResults = Array.from(shadow.querySelectorAll('.tf-result')).map(el => {
-          return {
-            title: el.querySelector('h3, a')?.textContent || '',
-            content: el.textContent || ''
-          };
-        }).filter(r => r.title && r.content);
-        
-        if (currentResults.length === 0) {
-          setResults(shadow, '<div style="color:#92400e; background-color: #fef3c7; padding: 12px; border-radius: 6px;">No results to summarize. Try a search first.</div>')
-          return;
-        }
-        
-        const context = currentResults
-          .map((r, i) => `Result ${i+1} (${r.title}): ${r.content.substring(0, 500)}...`)
-          .join('\n\n');
-        
-        const response = await fetchGemini(
-          'Please provide a concise summary of the following search results. Focus on the key points and insights.',
-          context
-        );
-        
-        if (response.error) {
-          const details = response.details ? `<pre style="white-space:pre-wrap; font-size:12px; color:#6b7280; margin-top:6px;">${JSON.stringify(response.details, null, 2)}</pre>` : ''
-          setResults(shadow, `<div style="color:#b91c1c; padding: 12px;">Error: ${response.error}${details}</div>`)
-        } else {
-          const text = response.text || 'No summary available'
-          setResults(shadow, `
-            <div style="padding: 12px;">
-              <h3 style="font-weight: 600; margin-bottom: 8px; color: #111827;">Summary of Results:</h3>
-              <div style="white-space: pre-wrap; line-height: 1.5; color: #1f2937;">${text}</div>
-            </div>
-          `)
-        }
       }
     } catch (e) {
       if (site === 'reddit') {
@@ -291,7 +251,7 @@ function showPanel(term: string) {
           shadow,
           `<div>Couldn’t load Reddit inline. <a href="${rurl}" target="_blank">Open results on Reddit</a>.</div>`
         )
-      } else if (site === 'gemini-answer' || site === 'gemini-summary') {
+      } else if (site === 'gemini-answer') {
         setResults(shadow, `<div style="color:#b91c1c; padding: 12px;">Error with Gemini: ${e.message || 'Unknown error'}</div>`)
       } else {
         setResults(shadow, `<div style="color:#b91c1c; padding: 12px;">Error loading ${site}.</div>`)
