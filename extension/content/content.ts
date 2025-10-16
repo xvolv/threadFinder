@@ -10,7 +10,7 @@ function createPanel() {
   host.style.bottom = '16px'
   host.style.right = '16px'
   host.style.zIndex = '2147483647'
-  host.style.width = '380px'
+  host.style.width = '440px'
   host.style.maxHeight = '60vh'
   host.style.boxShadow = '0 10px 30px rgba(0,0,0,0.2)'
   host.style.borderRadius = '10px'
@@ -29,10 +29,12 @@ function createPanel() {
     </div>
     <div style="padding:10px 12px; border-bottom: 1px solid #e5e7eb;">
       <div id="tf-term" style="font-size:12px; color:#6b7280; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"></div>
-      <div style="margin-top:8px; display:flex; gap:8px;">
+      <div style="margin-top:8px; display:flex; gap:8px; flex-wrap: wrap;">
         <button data-site="reddit" class="tf-tab" style="display:flex; align-items:center; gap:6px; padding:6px 10px; border:1px solid #e5e7eb; background:#f9fafb; border-radius:6px; cursor:pointer">Reddit</button>
         <button data-site="stackoverflow" class="tf-tab" style="display:flex; align-items:center; gap:6px; padding:6px 10px; border:1px solid #e5e7eb; background:#f9fafb; border-radius:6px; cursor:pointer">StackOverflow</button>
         <button data-site="wikipedia" class="tf-tab" style="display:flex; align-items:center; gap:6px; padding:6px 10px; border:1px solid #e5e7eb; background:#f9fafb; border-radius:6px; cursor:pointer">Wikipedia</button>
+        <button data-site="gemini-answer" class="tf-tab" style="display:flex; align-items:center; gap:6px; padding:6px 10px; border:1px solid #e5e7eb; background:#f9fafb; border-radius:6px; cursor:pointer">Gemini Answer</button>
+        <button data-site="gemini-summary" class="tf-tab" style="display:flex; align-items:center; gap:6px; padding:6px 10px; border:1px solid #e5e7eb; background:#f9fafb; border-radius:6px; cursor:pointer">Gemini Summary</button>
       </div>
     </div>
     <div id="tf-results" style="padding:10px 12px; overflow:auto; max-height: 45vh;">
@@ -47,12 +49,17 @@ function createPanel() {
     const r = shadow.querySelector('button.tf-tab[data-site="reddit"]') as HTMLButtonElement | null
     const s = shadow.querySelector('button.tf-tab[data-site="stackoverflow"]') as HTMLButtonElement | null
     const w = shadow.querySelector('button.tf-tab[data-site="wikipedia"]') as HTMLButtonElement | null
+    const ga = shadow.querySelector('button.tf-tab[data-site="gemini-answer"]') as HTMLButtonElement | null
+    const gs = shadow.querySelector('button.tf-tab[data-site="gemini-summary"]') as HTMLButtonElement | null
     const rIcon = (chrome.runtime as any)?.getURL ? (chrome.runtime as any).getURL('reddit.svg') : 'reddit.svg'
     const sIcon = (chrome.runtime as any)?.getURL ? (chrome.runtime as any).getURL('stackoverflow.svg') : 'stackoverflow.svg'
     const wIcon = (chrome.runtime as any)?.getURL ? (chrome.runtime as any).getURL('wikipedia.svg') : 'wikipedia.svg'
+    const gIcon = (chrome.runtime as any)?.getURL ? (chrome.runtime as any).getURL('gemini.svg') : 'gemini.svg'
     if (r) r.innerHTML = `<img alt="Reddit" src="${rIcon}" style="width:16px;height:16px;display:inline-block;"/> <span>Reddit</span>`
     if (s) s.innerHTML = `<img alt="StackOverflow" src="${sIcon}" style="width:16px;height:16px;display:inline-block;"/> <span>StackOverflow</span>`
     if (w) w.innerHTML = `<img alt="Wikipedia" src="${wIcon}" style="width:16px;height:16px;display:inline-block;"/> <span>Wikipedia</span>`
+    if (ga) ga.innerHTML = `<img alt="Gemini Answer" src="${gIcon}" style="width:16px;height:16px;display:inline-block;"/> <span>Gemini Answer</span>`
+    if (gs) gs.innerHTML = `<img alt="Gemini Summary" src="${gIcon}" style="width:16px;height:16px;display:inline-block;"/> <span>Gemini Summary</span>`
   } catch {}
   return { host, shadow, container }
 }
@@ -111,6 +118,57 @@ async function fetchWikipedia(term: string) {
   })
 }
 
+async function fetchGemini(prompt: string, context: string = '') {
+  function send(): Promise<any> {
+    return new Promise((resolve, reject) => {
+      try {
+        (chrome.runtime.sendMessage as any)(
+          { type: 'threadfinder:gemini', prompt, context },
+          (res: any) => {
+            const le = (chrome.runtime as any).lastError
+            if (le) {
+              reject(new Error(le.message))
+              return
+            }
+            resolve(res)
+          }
+        )
+      } catch (e) {
+        reject(e)
+      }
+    })
+  }
+
+  // Add a simple timeout in case the SW is asleep
+  const withTimeout = <T>(p: Promise<T>, ms = 10000) =>
+    new Promise<T>((resolve, reject) => {
+      const id = setTimeout(() => reject(new Error('Gemini request timed out')), ms)
+      p.then((v) => {
+        clearTimeout(id)
+        resolve(v)
+      }).catch((e) => {
+        clearTimeout(id)
+        reject(e)
+      })
+    })
+
+  try {
+    return await withTimeout(send())
+  } catch (e: any) {
+    // Retry once if receiving end missing (SW cold start)
+    if (String(e?.message || e).includes('Receiving end does not exist')) {
+      await new Promise((r) => setTimeout(r, 300))
+      return await withTimeout(send())
+    }
+    // If the extension was reloaded, the page needs a refresh to re-inject content scripts
+    const msg = String(e?.message || e)
+    if (msg.includes('Extension context invalidated') || msg.includes('The message port closed')) {
+      return { error: 'The extension was reloaded. Please refresh this page and try again.' }
+    }
+    throw e
+  }
+}
+
 function renderList(items: Array<{ title: string; url: string; extra?: string }>) {
   if (!items.length) return '<div style="color:#6b7280;">No results found.</div>'
   return `
@@ -118,7 +176,7 @@ function renderList(items: Array<{ title: string; url: string; extra?: string }>
       ${items
         .map(
           (it) => `
-        <li style="border:1px solid #e5e7eb; border-radius:8px; padding:8px 10px;">
+        <li class="tf-result" style="border:1px solid #e5e7eb; border-radius:8px; padding:8px 10px;">
           <a href="${it.url}" target="_blank" style="text-decoration:none; color:#111827; font-weight:600;">${it.title}</a>
           ${it.extra ? `<div style=\"font-size:12px; color:#6b7280; margin-top:2px;\">${it.extra}</div>` : ''}
         </li>`
@@ -169,6 +227,62 @@ function showPanel(term: string) {
           rows.map((r) => ({ title: r.title, url: r.url, extra: r.extra }))
         )
         setResults(shadow, list)
+      } else if (site === 'gemini-answer') {
+        setResults(shadow, '<div style="color:#6b7280; padding: 12px;">Asking Gemini about your selection...</div>')
+        const response = await fetchGemini(
+          `Answer the following question or provide information about the following text: ${term}`,
+          `The user selected this text on a webpage: ${term}`
+        )
+        
+        if (response.error) {
+          const details = response.details ? `<pre style="white-space:pre-wrap; font-size:12px; color:#6b7280; margin-top:6px;">${JSON.stringify(response.details, null, 2)}</pre>` : ''
+          setResults(shadow, `<div style="color:#b91c1c; padding: 12px;">Error: ${response.error}${details}</div>`)
+        } else {
+          const text = response.text || 'No response from Gemini'
+          setResults(shadow, `
+            <div style="padding: 12px;">
+              <h3 style="font-weight: 600; margin-bottom: 8px; color: #111827;">Gemini's Response:</h3>
+              <div style="white-space: pre-wrap; line-height: 1.5; color: #1f2937;">${text}</div>
+            </div>
+          `)
+        }
+      } else if (site === 'gemini-summary') {
+        setResults(shadow, '<div style="color:#6b7280; padding: 12px;">Summarizing results with Gemini...</div>')
+        
+        // Get the current results to summarize
+        const currentResults = Array.from(shadow.querySelectorAll('.tf-result')).map(el => {
+          return {
+            title: el.querySelector('h3, a')?.textContent || '',
+            content: el.textContent || ''
+          };
+        }).filter(r => r.title && r.content);
+        
+        if (currentResults.length === 0) {
+          setResults(shadow, '<div style="color:#92400e; background-color: #fef3c7; padding: 12px; border-radius: 6px;">No results to summarize. Try a search first.</div>')
+          return;
+        }
+        
+        const context = currentResults
+          .map((r, i) => `Result ${i+1} (${r.title}): ${r.content.substring(0, 500)}...`)
+          .join('\n\n');
+        
+        const response = await fetchGemini(
+          'Please provide a concise summary of the following search results. Focus on the key points and insights.',
+          context
+        );
+        
+        if (response.error) {
+          const details = response.details ? `<pre style="white-space:pre-wrap; font-size:12px; color:#6b7280; margin-top:6px;">${JSON.stringify(response.details, null, 2)}</pre>` : ''
+          setResults(shadow, `<div style="color:#b91c1c; padding: 12px;">Error: ${response.error}${details}</div>`)
+        } else {
+          const text = response.text || 'No summary available'
+          setResults(shadow, `
+            <div style="padding: 12px;">
+              <h3 style="font-weight: 600; margin-bottom: 8px; color: #111827;">Summary of Results:</h3>
+              <div style="white-space: pre-wrap; line-height: 1.5; color: #1f2937;">${text}</div>
+            </div>
+          `)
+        }
       }
     } catch (e) {
       if (site === 'reddit') {
@@ -177,8 +291,10 @@ function showPanel(term: string) {
           shadow,
           `<div>Couldn’t load Reddit inline. <a href="${rurl}" target="_blank">Open results on Reddit</a>.</div>`
         )
+      } else if (site === 'gemini-answer' || site === 'gemini-summary') {
+        setResults(shadow, `<div style="color:#b91c1c; padding: 12px;">Error with Gemini: ${e.message || 'Unknown error'}</div>`)
       } else {
-        setResults(shadow, `<div style="color:#b91c1c;">Error loading ${site}.</div>`)
+        setResults(shadow, `<div style="color:#b91c1c; padding: 12px;">Error loading ${site}.</div>`)
       }
     }
   }

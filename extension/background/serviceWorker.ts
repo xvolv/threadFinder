@@ -44,7 +44,7 @@ try {
   console.warn('Context menus not available:', e)
 }
 
-// Handle cross-origin fetches (e.g., Reddit) from the background to avoid page CORS/CSP issues
+// Handle cross-origin fetches (e.g., Reddit, Gemini) from the background to avoid page CORS/CSP issues
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.type === 'threadfinder:fetchReddit' && typeof msg.term === 'string') {
     (async () => {
@@ -58,9 +58,92 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     })()
     // Keep the message channel open for async response
     return true
+  } 
+  
+  // Handle Gemini API requests
+  if (msg && msg.type === 'threadfinder:gemini' && typeof msg.prompt === 'string') {
+    (async () => {
+      try {
+        const result = await handleGeminiRequest(msg.prompt, msg.context || '');
+        (sendResponse as any)({ text: result });
+      } catch (error) {
+        console.error('Gemini API error:', error);
+        (sendResponse as any)({ 
+          error: error.message || 'Failed to get response from Gemini',
+          details: (error as any).details
+        });
+      }
+    })();
+    return true; // Keep the message channel open for async response
   }
-  return false
+  
+  return false;
 })
+
+async function handleGeminiRequest(prompt: string, context: string = ''): Promise<string> {
+  // Get the API key from storage
+  const result = await chrome.storage.sync.get('GEMINI_API_KEY');
+  const apiKey = result.GEMINI_API_KEY;
+  
+  if (!apiKey) {
+    throw new Error('Gemini API key not found. Please set it in the extension options.');
+  }
+
+  // Prepare request body
+  const body = {
+    contents: [{
+      role: 'user',
+      parts: [{
+        text: `${prompt}\n\nContext:\n${context || 'No additional context provided.'}`
+      }],
+    }],
+    generationConfig: {
+      temperature: 0.7,
+      topK: 40,
+      topP: 0.95,
+      maxOutputTokens: 1024,
+    },
+  };
+
+  // Try preferred model first, then fallback
+  const models = [
+    'gemini-1.5-flash',
+    'gemini-1.5-pro',
+  ];
+
+  let lastErr: any = null;
+  for (const model of models) {
+    const apiUrl = `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${apiKey}`;
+    try {
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        const error = new Error(`API error (${model}): ${response.status} ${response.statusText}`);
+        (error as any).details = errorData;
+        lastErr = error;
+        // Try next model
+        continue;
+      }
+
+      const data = await response.json();
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (text) return text;
+      lastErr = new Error(`Empty response from ${model}`);
+    } catch (e) {
+      lastErr = e;
+      // Try next model
+    }
+  }
+
+  throw lastErr || new Error('Gemini request failed');
+}
 
 // --- Simple cache + fetch helper for Reddit ---
 type RedditRow = { title: string; url: string; subreddit: string }
